@@ -1,0 +1,381 @@
+# Load required libraries
+library(readxl); library(lme4); library(lmerTest); library(dplyr); library(tidyr); library(ggplot2); library(gridExtra); library(emmeans); library(broom.mixed); library(stringr); library(purrr)
+
+# Set global options
+options(scipen = 6)    # Moderate penalty against scientific notation
+options(digits = 4)    # Set number of digits to display
+
+# Read data
+data <- read_xlsx("OUTPUT (TONE).xlsx", sheet = "All")
+
+# Function to add significance stars
+add_significance <- function(p_value) {
+  cut(p_value, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", ".", ""),  right = FALSE)}
+
+# DATASET-WISE MEAN IMPUTATION FUNCTION
+impute_dataset_means <- function(data) {
+  data %>%
+    group_by(Dataset) %>%
+    mutate(across(c(F0, Duration, p0:p10), ~{
+      if(any(is.na(.))) {
+        ifelse(is.na(.), mean(., na.rm = TRUE), .)
+      } else {
+        .
+      }
+    })) %>%
+    ungroup()
+}
+
+# Data preprocessing with dataset-wise imputation
+data_clean <- data %>%
+  mutate(across(c(Tone, Gender, Subject, Pair, TBU_syll, Syllable, WordType, Dataset), factor),
+         Tone = relevel(factor(Tone, levels = c("Neutral", "Low")), ref = "Neutral")) %>%
+  impute_dataset_means()
+
+# Create monosyllabic datasets
+monosyll_datasets <- list(
+  "Mono-M" = data_clean %>% filter(WordType == "Monosyllabic", Gender == "MALE"),
+  "Mono-F" = data_clean %>% filter(WordType == "Monosyllabic", Gender == "FEMALE")
+)
+
+# Combine for overall monosyllabic analysis (using dataset-wise imputed data)
+monosyll_data <- data_clean %>% filter(WordType == "Monosyllabic")
+
+# Create disyllabic datasets
+create_disyllabic_datasets <- function(data) {
+  genders <- c("MALE", "FEMALE")
+  tbu_locs <- c("TS1", "TS2")
+  syllables <- c("Syll1", "Syll2")
+  
+  datasets <- list()
+  for(gender in genders) {
+    for(tbu in tbu_locs) {
+      for(i in seq_along(syllables)) {
+        syll <- syllables[i]
+        ds_name <- paste0(gender, "-", tbu, "s", ifelse(i == 1, "i", "ii"))
+        datasets[[ds_name]] <- data %>% 
+          filter(WordType == "Disyllabic", Gender == gender, TBU_syll == tbu, Syllable == syll)
+      }
+    }
+  }
+  datasets
+}
+
+disyll_datasets <- create_disyllabic_datasets(data_clean)
+disyll_data <- data_clean %>% filter(WordType == "Disyllabic")
+
+# Timepoints for contour analysis
+timepoints <- paste0("p", 0:10)
+
+
+###########################
+## MONOSYLLABIC ANALYSIS ##
+###########################
+
+# LME models function
+fit_lme <- function(formula, data) {
+  lmer(formula, data = data)
+}
+
+# F0 analysis - using dataset-wise imputed data
+lme_mono_f0 <- fit_lme(F0 ~ Tone + (1 | Subject) + (1 | Pair), monosyll_data)
+lme_mono_f0_null <- fit_lme(F0 ~ 1 + (1 | Subject) + (1 | Pair), monosyll_data)
+summary(lme_mono_f0)
+# Gender-wise models using the specific datasets
+lme_mono_f0_male <- fit_lme(F0 ~ Tone + (1 | Subject) + (1 | Pair), monosyll_datasets[["Mono-M"]])
+summary(lme_mono_f0_male)
+lme_mono_f0_female <- fit_lme(F0 ~ Tone + (1 | Subject) + (1 | Pair), monosyll_datasets[["Mono-F"]])
+summary(lme_mono_f0_female)
+
+# Extract fixed effects
+extract_fixef <- function(model) summary(model)$coefficients
+fixef_mono_overall <- extract_fixef(lme_mono_f0)
+fixef_mono_male <- extract_fixef(lme_mono_f0_male)
+fixef_mono_female <- extract_fixef(lme_mono_f0_female)
+
+
+# FIGURES 2-3: Boxplots
+create_boxplot <- function(data, x_var, y_var, facet_var, title) {
+  ggplot(data, aes(x = .data[[x_var]], y = .data[[y_var]], fill = .data[[x_var]])) +
+    geom_boxplot() +
+    {if(facet_var != "1") facet_wrap(as.formula(paste("~", facet_var)), scales = "free")} +
+    labs(title = title, y = y_var, x = x_var) +
+    theme_minimal() +
+    theme(
+      strip.placement = "outside", 
+      axis.text.x = element_text(angle = 45, hjust = 1), 
+      panel.background = element_rect(fill = "grey90", color = NA), 
+      panel.grid.major = element_line(color = "grey80"), 
+      panel.grid.minor = element_line(color = "grey85"), 
+      strip.background = element_rect(fill = "grey80")
+    )
+}
+
+figure2 <- create_boxplot(monosyll_data, "Tone", "F0", "Gender", "Boxplot (Gender-wise) of Pitch contrast")
+print(figure2)
+figure3 <- create_boxplot(monosyll_data, "Tone", "F0", "1", "Subject-wise Mid-vowel F0 by Tone in Monosyllables") +
+  facet_grid(~Subject)
+print(figure3)
+
+# Pitch contour analysis by gender
+analyze_contours <- function(gender_data, gender_name) {
+  map_dfr(timepoints, function(tp) {
+    model <- fit_lme(as.formula(paste(tp, "~ Tone + (1 | Subject) + (1 | Pair)")), gender_data)
+    fe <- extract_fixef(model)
+    
+    map_dfr(1:nrow(fe), function(i) {
+      data.frame(
+        Timepoint = tp,
+        Term = rownames(fe)[i],
+        Estimate = fe[i, 1],
+        Std_Error = fe[i, 2],
+        df = fe[i, 3],
+        t_value = fe[i, 4],
+        p_value = fe[i, 5],
+        Signif = add_significance(fe[i, 5])
+      )
+    })
+  })
+}
+
+contour_male <- analyze_contours(monosyll_data %>% filter(Gender == "MALE"), "MALE")
+contour_female <- analyze_contours(monosyll_data %>% filter(Gender == "FEMALE"), "FEMALE")
+
+cat("=== MALE SPEAKERS - FIXED EFFECTS ===\n")
+print(contour_male, row.names = FALSE)
+cat("=== FEMALE SPEAKERS - FIXED EFFECTS ===\n")
+print(contour_female, row.names = FALSE)
+cat("Significance codes: *** p < 0.001, ** p < 0.01, * p < 0.05, . p < 0.1\n\n")
+
+# FIGURES 5-6: Pitch contour boxplots
+prepare_contour_data <- function(word_data) {
+  data.frame(
+    Time_Intervals = rep(timepoints, each = nrow(word_data)),
+    Value = as.vector(as.matrix(word_data[timepoints])),
+    Tone = rep(word_data$Tone, times = length(timepoints)),
+    Subject = rep(word_data$Subject, times = length(timepoints)),
+    Gender = rep(word_data$Gender, times = length(timepoints))
+  ) %>%
+    mutate(
+      Time_Intervals = factor(Time_Intervals, levels = timepoints),
+      Tone = factor(Tone, levels = c("Neutral", "Low"))
+    )
+}
+
+monosyll_long_original <- prepare_contour_data(data[data$WordType == "Monosyllabic",])
+
+create_contour_plot <- function(data, facet_var, title) {
+  ggplot(data, aes(x = Time_Intervals, y = Value, fill = Tone)) +
+    geom_boxplot(outlier.shape = NA) +
+    labs(y = "F0 (Hz)", x = "The 11 Equidistant Time-Points in the Vowel Nucleus", title = title) +
+    facet_wrap(as.formula(paste("~", facet_var)), scales = "free") +
+    theme(
+      axis.text = element_text(size = 9, face = "bold"), 
+      axis.title = element_text(size = 12, face = "bold"), 
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+}
+
+figure5 <- create_contour_plot(monosyll_long_original, "Gender", "Pitch Contour Contrast Between Neutral and Low Tones \nin Monosyllables (Gender-wise)")
+print(figure5); 
+figure6 <- create_contour_plot(monosyll_long_original, "Subject", "Subject-wise F0 Contour by Tone in Monosyllables")
+print(figure6)
+
+# FIGURE 7: Individual pairs contours
+figure7_data <- monosyll_data %>%
+  select(Pair, Tone, all_of(timepoints)) %>%
+  pivot_longer(cols = all_of(timepoints), names_to = "Timepoint", values_to = "F0") %>%
+  mutate(Timepoint = as.numeric(str_remove(Timepoint, "p")))
+
+figure7 <- ggplot(figure7_data, aes(x = Timepoint, y = F0, color = Tone, group = Tone)) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  stat_summary(fun = mean, geom = "line", size = 0.5, alpha = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, alpha = 0.7) +
+  facet_wrap(~ Pair, ncol = 4) +
+  scale_x_continuous(breaks = 0:10, labels = paste0("p", 0:10)) +
+  labs(title = "Pair-wise F0 Contours by Tone (Monosyllabic Tonal Pairs)", x = "Timepoint", y = "F0 (Hz)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(figure7)
+
+# Duration analysis
+lme_mono_dur <- fit_lme(Duration ~ Tone + (1 | Subject) + (1 | Pair), monosyll_data)
+summary(lme_mono_dur)
+dur_fixef <- extract_fixef(lme_mono_dur)
+# Gender-wise models using the specific datasets
+lme_mono_dur_male <- fit_lme(Duration ~ Tone + (1 | Subject) + (1 | Pair), monosyll_datasets[["Mono-M"]])
+summary(lme_mono_dur_male)
+lme_mono_dur_female <- fit_lme(Duration ~ Tone + (1 | Subject) + (1 | Pair), monosyll_datasets[["Mono-F"]])
+summary(lme_mono_dur_female)
+
+# FIGURE 9: Duration boxplot
+figure9 <- create_boxplot(monosyll_data, "Tone", "Duration", "1", "Subject-wise Vowel Duration by Tone in Monosyllables") +
+  facet_grid(~Subject, scales = "free", switch = "y")
+print(figure9)
+
+#########################
+## DISYLLABIC ANALYSIS ##
+#########################
+
+# Preliminary Overview of Tonal Contrast in Disyllabic words with an interaction term (Syllable*Tone)
+lme_di_f0 <- fit_lme(F0 ~ Syllable*Tone + (1 | Subject) + (1 | Pair), disyll_data)
+summary(lme_di_f0)
+emmeans(lme_di_f0, pairwise ~ Syllable*Tone)
+
+# Fit models for all nuanced datasets using the pre-created dataset-wise imputed datasets
+fit_dataset_models <- function(datasets) {
+  map(datasets, function(ds) {
+    list(
+      f0 = fit_lme(F0 ~ Tone + (1 | Subject) + (1 | Pair), ds),
+      dur = fit_lme(Duration ~ Tone + (1 | Subject) + (1 | Pair), ds)
+    )
+  })
+}
+
+# Use the disyllabic datasets that were created with dataset-wise imputation
+dataset_models <- fit_dataset_models(disyll_datasets)
+
+# Create results tables
+create_results_table <- function(models, dep_var) {
+  map_dfr(names(models), function(ds_name) {
+    fe <- extract_fixef(models[[ds_name]][[dep_var]])
+    map_dfr(1:nrow(fe), function(i) {
+      data.frame(
+        Dataset = ds_name,
+        Dependent_Variable = dep_var,
+        Term = rownames(fe)[i],
+        Estimate = fe[i, 1],
+        Std_Error = fe[i, 2],
+        df = fe[i, 3],
+        t_value = fe[i, 4],
+        p_value = fe[i, 5],
+        Signif = add_significance(fe[i, 5])
+      )
+    })
+  })
+}
+
+f0_results <- create_results_table(dataset_models, "f0")
+dur_results <- create_results_table(dataset_models, "dur")
+
+cat("FIXED EFFECTS FOR F0 MODELS (DISYLLABIC)\n========================================\n")
+print(f0_results, row.names = FALSE)
+cat("Significance codes: *** p < 0.001, ** p < 0.01, * p < 0.05, . p < 0.1\n\n")
+
+cat("FIXED EFFECTS FOR DURATION MODELS (DISYLLABIC)\n==============================================\n")
+print(dur_results, row.names = FALSE, digits = 6)
+cat("Significance codes: *** p < 0.001, ** p < 0.01, * p < 0.05, . p < 0.1\n\n")
+
+# Timepoint-wise analysis for disyllables using dataset-wise imputed data
+disyll_timepoint_results <- map(disyll_datasets, function(ds) {
+  map_dfr(timepoints, function(tp) {
+    model <- fit_lme(as.formula(paste(tp, "~ Tone + (1 | Subject) + (1 | Pair)")), ds)
+    fe <- extract_fixef(model)
+    map_dfr(1:nrow(fe), function(i) {
+      data.frame(
+        Dataset = paste0(unique(ds$Gender), "-", unique(ds$TBU_syll), "s", 
+                         ifelse(unique(ds$Syllable) == "Syll1", "i", "ii")),
+        Timepoint = tp,
+        Term = rownames(fe)[i],
+        Estimate = fe[i, 1],
+        Std_Error = fe[i, 2],
+        df = fe[i, 3],
+        t_value = fe[i, 4],
+        p_value = fe[i, 5],
+        Signif = add_significance(fe[i, 5])
+      )
+    })
+  })
+})
+
+# Print timepoint results
+walk(names(disyll_timepoint_results), function(ds_name) {
+  cat("\n", strrep("=", 60), "\n")
+  cat("TIMEPOINT-WISE FIXED EFFECTS FOR DATASET:", ds_name, "\n")
+  cat(strrep("=", 60), "\n")
+  print(disyll_timepoint_results[[ds_name]], row.names = FALSE)
+  cat("Significance codes: *** p < 0.001, ** p < 0.01, * p < 0.05, . p < 0.1\n")
+})
+
+
+
+# FIGURE 12: Subject-wise mid-vowel F0 effects
+figure12 <- create_boxplot(disyll_data, "Tone", "F0", "Subject", "Subject-wise mid-vowel F0 by Tone in Disyllables\n(TS = TBU Syllable; Syll = Analyzed Syllable)") +
+  facet_grid(Subject ~ TBU_syll + Syllable, scales = "free", switch = "y")
+print(figure12)
+
+# FOR FIGURES 13-14:
+# Helper function for disyllabic contour data
+prepare_disyll_contour_data <- function(gender) {
+  gender_data <- data %>% filter(Gender == gender, WordType == "Disyllabic")
+  data.frame(
+    Time_Intervals = rep(timepoints, each = nrow(gender_data)),
+    Value = as.vector(as.matrix(gender_data[timepoints])),
+    Tone = rep(gender_data$Tone, times = length(timepoints)),
+    Subject = rep(gender_data$Subject, times = length(timepoints)),
+    TBU_syll = rep(gender_data$TBU_syll, times = length(timepoints)),
+    Syllable = rep(gender_data$Syllable, times = length(timepoints))
+  ) %>%
+    mutate(
+      Time_Intervals = factor(Time_Intervals, levels = timepoints),
+      Tone = factor(Tone, levels = c("Neutral", "Low"))
+    )
+}
+
+# FIGURES 13-14: Disyllabic contour plots
+create_disyll_contour_plot <- function(data, title) {
+  ggplot(data, aes(x = Time_Intervals, y = Value, fill = Tone)) +
+    geom_boxplot(outlier.shape = NA) +
+    labs(y = "F0 (Hz)", x = "The 11 Equidistant Time-Points in the Vowel Nucleus", title = title) +
+    facet_grid(Subject ~ TBU_syll + Syllable, scales = "free_y", switch = "y") +
+    theme(
+      strip.placement = "outside",
+      axis.text = element_text(size = 8, face = "bold"), 
+      axis.title = element_text(size = 10, face = "bold"), 
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(size = 8, face = "bold")
+    )
+}
+
+male_disyll_long <- prepare_disyll_contour_data("MALE")
+female_disyll_long <- prepare_disyll_contour_data("FEMALE")
+
+figure13 <- create_disyll_contour_plot(male_disyll_long, "Subject-wise (Males) F0 Contour by Tone in Disyllables\n(TS = TBU Syllable; Syll = Analysed Syllable)")
+figure14 <- create_disyll_contour_plot(female_disyll_long, "Subject-wise (Females) F0 Contour by Tone in Disyllables\n(TS = TBU Syllable; Syll = Analysed Syllable)")
+print(figure13); print(figure14)
+
+# FOR FIGURES 15-16:
+# Helper function for individual pair contours
+create_pair_contour_plot <- function(tbu_filter, title_suffix) {
+  plot_data <- disyll_data %>%
+    filter(TBU_syll == tbu_filter) %>%
+    select(Pair, Tone, Syllable, all_of(timepoints)) %>%
+    pivot_longer(cols = all_of(timepoints), names_to = "Timepoint", values_to = "F0") %>%
+    mutate(Timepoint = as.numeric(str_remove(Timepoint, "p")))
+  
+  ggplot(plot_data, aes(x = Timepoint, y = F0, color = Tone, group = Tone)) +
+    stat_summary(fun = mean, geom = "point", size = 2) +
+    stat_summary(fun = mean, geom = "line", size = 0.5, alpha = 0.7) +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3, alpha = 0.7) +
+    facet_wrap(~ Pair ~ Syllable, ncol = 4) +
+    scale_x_continuous(breaks = 0:10, labels = paste0("p", 0:10)) +
+    labs(title = paste("Pair-wise F0 Contours by Tone (Disyllabic Tonal Pairs)", title_suffix), 
+         x = "Timepoint", y = "F0 (Hz)") +
+    theme_minimal() +
+    theme(
+      strip.placement = "outside", 
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "grey98", color = NA),
+      strip.background = element_rect(fill = "grey85")
+    )
+}
+
+# FIGURES 15-16: Individual pairs contours
+figure15 <- create_pair_contour_plot("TS1", "\n(when Syllable 1 is the TBU)")
+figure16 <- create_pair_contour_plot("TS2", "\n(when Syllable 2 is the TBU)")
+print(figure15); print(figure16)
+
+# FIGURE 18: Subject-wise duration effects
+figure18 <- create_boxplot(disyll_data, "Tone", "Duration", "Subject", "Subject-wise Vowel Duration by Tone in Disyllables\n(TS = TBU Syllable; Syll = Analyzed Syllable)") +
+  facet_grid(Subject ~ TBU_syll + Syllable, switch = "y", scales = "free_y")
+print(figure18)
